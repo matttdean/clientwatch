@@ -68,6 +68,23 @@ const FIREBASE_CONFIG = {
   measurementId: "G-G02PQ8LQKT",
 };
 
+// Remove undefineds so Firestore is happy
+function sanitizeLead(l: any) {
+    if (!l || typeof l !== "object") return l;
+    const out: any = {};
+    for (const [k, v] of Object.entries(l)) {
+      if (v === undefined) continue;          // drop undefined
+      if (Array.isArray(v)) out[k] = v.map(sanitizeLead);
+      else if (v && typeof v === "object") out[k] = sanitizeLead(v);
+      else out[k] = v;
+    }
+    return out;
+  }
+  function sanitizeLeads(arr: any[]) {
+    return (Array.isArray(arr) ? arr : []).filter(Boolean).map(sanitizeLead);
+  }
+  
+
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -163,21 +180,25 @@ export default function LeadsTracker() {
     };
   }, []);
 
-  // Debounced cloud save on local leads change
-  useEffect(() => {
+// Debounced cloud save on local leads change
+useEffect(() => {
     if (!ENABLE_CLOUD_SYNC) return;
     if (!fb.current.db) return;
     if (fb.current.applying) return;
-
-    const simple = JSON.stringify({ leads });
+  
+    const safeLeads = sanitizeLeads(leads);
+    const simple = JSON.stringify({ leads: safeLeads });
     if (fb.current.lastSaved === simple) return;
-
+  
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
         await setDoc(
           doc(fb.current.db, "shared", "clientwatch"),
-          { leads, leadsUpdatedAt: serverTimestamp() },
+          {
+            leads: safeLeads,               // <-- sanitized!
+            leadsUpdatedAt: serverTimestamp(),
+          },
           { merge: true }
         );
         fb.current.lastSaved = simple;
@@ -185,11 +206,12 @@ export default function LeadsTracker() {
         console.error("Leads save failed", e);
       }
     }, 600);
-
+  
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
   }, [leads]);
+  
 
   // Derived views
   const filtered = useMemo(() => {
