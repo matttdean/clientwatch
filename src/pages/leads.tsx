@@ -2,55 +2,48 @@ import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { Plus, Search, Filter, Download, Upload, Trash2, Pencil, Save, X, Phone, Mail, Globe, CalendarDays, Tag } from "lucide-react";
 
+// 🔗 Firebase for cloud sync (same project/doc as ClientWatch)
+import { initializeApp, getApp, getApps } from "firebase/app";
+import { getFirestore, doc, onSnapshot, setDoc, serverTimestamp } from "firebase/firestore";
+
 /**
- * ClientWatch – Leads Tracker
+ * ClientWatch – Leads Tracker (Local + Cloud)
  * ---------------------------------------------
- * Drop this file into your app (e.g., src/pages/Leads.tsx) and add a route to it.
- * Uses TailwindCSS (dark mode friendly) + localStorage (no backend required).
+ * - Local persistence via localStorage (same namespace as ClientWatch)
+ * - Cloud sync via Firestore, doc: shared/clientwatch (field: leads)
+ * - Dark mode, Tailwind, framer-motion
  *
- * STORAGE KEY: "clientwatch_leads_v1"
- *
- * NOTES
- * - Clean, single-file component (no duplicates)
- * - Grouped by Status with color-coded badges
- * - Quick add form, inline edit, search & filter, import/export JSON
- * - Sorts by Status, then by priority (High→Low), then by updatedAt
+ * ROUTE: mount at /leads (React Router)
  */
 
 // ---- Types ----
-const STATUSES = [
-  "New",
-  "Contacted",
-  "Qualified",
-  "Proposal",
-  "Won",
-  "Lost",
-] as const;
-
+const STATUSES = ["New", "Contacted", "Qualified", "Proposal", "Won", "Lost"] as const;
 type Status = typeof STATUSES[number];
 
 type Lead = {
   id: string;
-  name: string; // Contact name
+  name: string;
   business?: string;
   email?: string;
   phone?: string;
   website?: string;
   status: Status;
   priority: "High" | "Medium" | "Low";
-  source?: string; // e.g. BNI, Referral, Google, Walk-in
+  source?: string;
   notes?: string;
   createdAt: number;
   updatedAt: number;
 };
 
 // ---- Utils ----
-const STORAGE_KEY = "clientwatch_leads_v1";
+// Match ClientWatch local namespace
+const STORAGE_KEY = "clientwatch-local-v1";
 
-function useLocalStorage<T>(key: string, initial: T) {
-  const [value, setValue] = useState<T>(() => {
+// small local persistent state hook (same behavior as in ClientWatch)
+function usePersistentState<T>(key: string, initial: T) {
+  const [state, setState] = useState<T>(() => {
     try {
-      const raw = localStorage.getItem(key);
+      const raw = typeof window !== "undefined" ? localStorage.getItem(key) : null;
       return raw ? (JSON.parse(raw) as T) : initial;
     } catch {
       return initial;
@@ -58,10 +51,25 @@ function useLocalStorage<T>(key: string, initial: T) {
   });
   useEffect(() => {
     try {
-      localStorage.setItem(key, JSON.stringify(value));
+      if (typeof window !== "undefined") localStorage.setItem(key, JSON.stringify(state));
     } catch {}
-  }, [key, value]);
-  return [value, setValue] as const;
+  }, [key, state]);
+  return [state, setState] as const;
+}
+
+// Firebase config (same as your App.jsx)
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDn4HV6Y1NFlBY1xnQR2KceGAcIK26E52Y",
+  authDomain: "clientwatch-a241c.firebaseapp.com",
+  projectId: "clientwatch-a241c",
+  storageBucket: "clientwatch-a241c.firebasestorage.app",
+  messagingSenderId: "176782767425",
+  appId: "1:176782767425:web:56c00f6779847af2fc9dc0",
+  measurementId: "G-G02PQ8LQKT",
+};
+
+function uid() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
 const statusStyles: Record<Status, string> = {
@@ -79,33 +87,27 @@ const priorityStyles: Record<Lead["priority"], string> = {
   Low: "text-zinc-300",
 };
 
-function uid() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
 function sortLeads(a: Lead, b: Lead) {
-  // Status order
   const order: Status[] = ["New", "Contacted", "Qualified", "Proposal", "Won", "Lost"];
   const sdiff = order.indexOf(a.status) - order.indexOf(b.status);
   if (sdiff !== 0) return sdiff;
-  // Priority High→Low
   const p = { High: 0, Medium: 1, Low: 2 } as const;
   const pdiff = p[a.priority] - p[b.priority];
   if (pdiff !== 0) return pdiff;
-  // Newest updated first
-  return b.updatedAt - a.updatedAt;
+  return b.updatedAt - a.updatedAt; // newest first
 }
 
 // ---- Component ----
 export default function LeadsTracker() {
-  const [leads, setLeads] = useLocalStorage<Lead[]>(STORAGE_KEY, []);
+  // Local persistence (same namespace as ClientWatch)
+  const [leads, setLeads] = usePersistentState<Lead[]>(`${STORAGE_KEY}:leads`, []);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<"All" | Status>("All");
   const [priorityFilter, setPriorityFilter] = useState<"All" | Lead["priority"]>("All");
   const [showForm, setShowForm] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  // Quick-add form state
+  // Quick-add form
   const [form, setForm] = useState({
     name: "",
     business: "",
@@ -118,12 +120,82 @@ export default function LeadsTracker() {
     notes: "",
   });
 
+  // --- Cloud sync (Firestore) ---
+  const ENABLE_CLOUD_SYNC = true;
+  const fb = React.useRef<{ app: any; db: any; unsub: any; applying: boolean; lastSaved: string }>({
+    app: null,
+    db: null,
+    unsub: null,
+    applying: false,
+    lastSaved: "",
+  });
+  const saveTimer = React.useRef<any>(null);
+
+  // Subscribe to leads in Firestore once
+  useEffect(() => {
+    if (!ENABLE_CLOUD_SYNC) return;
+    try {
+      const app = getApps().length ? getApp() : initializeApp(FIREBASE_CONFIG);
+      const db = getFirestore(app);
+      fb.current.app = app;
+      fb.current.db = db;
+
+      const ref = doc(db, "shared", "clientwatch");
+      fb.current.unsub = onSnapshot(ref, (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data() || ({} as any);
+        if (!data.leads) return;
+
+        // prevent feedback loop when applying remote state
+        fb.current.applying = true;
+        const next = Array.isArray(data.leads) ? (data.leads as Lead[]) : [];
+        setLeads(next.sort(sortLeads));
+        fb.current.lastSaved = JSON.stringify({ leads: next });
+        setTimeout(() => {
+          fb.current.applying = false;
+        }, 0);
+      });
+    } catch (e) {
+      console.error("Leads sync init failed", e);
+    }
+    return () => {
+      if (fb.current.unsub) fb.current.unsub();
+    };
+  }, []);
+
+  // Debounced cloud save on local leads change
+  useEffect(() => {
+    if (!ENABLE_CLOUD_SYNC) return;
+    if (!fb.current.db) return;
+    if (fb.current.applying) return;
+
+    const simple = JSON.stringify({ leads });
+    if (fb.current.lastSaved === simple) return;
+
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await setDoc(
+          doc(fb.current.db, "shared", "clientwatch"),
+          { leads, leadsUpdatedAt: serverTimestamp() },
+          { merge: true }
+        );
+        fb.current.lastSaved = simple;
+      } catch (e) {
+        console.error("Leads save failed", e);
+      }
+    }, 600);
+
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, [leads]);
+
+  // Derived views
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return [...leads]
-      .filter((l) =>
-        statusFilter === "All" ? true : l.status === statusFilter
-      )
+      .filter((l) => (statusFilter === "All" ? true : l.status === statusFilter))
       .filter((l) => (priorityFilter === "All" ? true : l.priority === priorityFilter))
       .filter((l) =>
         q
@@ -141,6 +213,7 @@ export default function LeadsTracker() {
     return map;
   }, [filtered]);
 
+  // Actions
   function resetForm() {
     setForm({
       name: "",
@@ -183,9 +256,7 @@ export default function LeadsTracker() {
   }
 
   function updateLead(id: string, patch: Partial<Lead>) {
-    setLeads((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, ...patch, updatedAt: Date.now() } : l))
-    );
+    setLeads((prev) => prev.map((l) => (l.id === id ? { ...l, ...patch, updatedAt: Date.now() } : l)));
   }
 
   function exportJSON() {
@@ -206,7 +277,6 @@ export default function LeadsTracker() {
       try {
         const data = JSON.parse(String(reader.result));
         if (Array.isArray(data)) {
-          // Basic shape validation
           const clean: Lead[] = data
             .map((d: any) => ({
               id: d.id || uid(),
@@ -230,7 +300,6 @@ export default function LeadsTracker() {
       }
     };
     reader.readAsText(file);
-    // allow re-importing the same file
     e.target.value = "";
   }
 
@@ -241,7 +310,7 @@ export default function LeadsTracker() {
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
             <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Leads</h1>
-            <p className="text-zinc-400">Add, track, and organize potential clients in ClientWatch.</p>
+            <p className="text-zinc-400">Add, track, and organize potential clients in ClientWatch. (Cloud sync on)</p>
           </div>
           <div className="flex items-center gap-2">
             <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-zinc-900 ring-1 ring-white/10 cursor-pointer">
@@ -277,7 +346,9 @@ export default function LeadsTracker() {
               >
                 <option value="All">All Statuses</option>
                 {STATUSES.map((s) => (
-                  <option key={s} value={s}>{s}</option>
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
                 ))}
               </select>
             </div>
@@ -299,10 +370,7 @@ export default function LeadsTracker() {
 
         {/* Quick Add */}
         <div className="mt-6">
-          <button
-            onClick={() => setShowForm((s) => !s)}
-            className="mb-3 inline-flex items-center gap-2 text-sm text-zinc-300 hover:text-white"
-          >
+          <button onClick={() => setShowForm((s) => !s)} className="mb-3 inline-flex items-center gap-2 text-sm text-zinc-300 hover:text-white">
             {showForm ? <X className="size-4" /> : <Plus className="size-4" />} {showForm ? "Hide quick add" : "Quick add"}
           </button>
           {showForm && (
@@ -312,25 +380,17 @@ export default function LeadsTracker() {
               <Input label="Email" type="email" leftIcon={<Mail className="size-4" />} value={form.email} onChange={(v) => setForm({ ...form, email: v })} />
               <Input label="Phone" leftIcon={<Phone className="size-4" />} value={form.phone} onChange={(v) => setForm({ ...form, phone: v })} />
               <Input label="Website" leftIcon={<Globe className="size-4" />} value={form.website} onChange={(v) => setForm({ ...form, website: v })} />
-              <Select
-                label="Status"
-                value={form.status}
-                onChange={(v) => setForm({ ...form, status: v as Status })}
-                options={STATUSES.map((s) => ({ label: s, value: s }))}
-              />
-              <Select
-                label="Priority"
-                value={form.priority}
-                onChange={(v) => setForm({ ...form, priority: v as Lead["priority"] })}
-                options={["High", "Medium", "Low"].map((p) => ({ label: p, value: p }))}
-              />
+              <Select label="Status" value={form.status} onChange={(v) => setForm({ ...form, status: v as Status })} options={STATUSES.map((s) => ({ label: s, value: s }))} />
+              <Select label="Priority" value={form.priority} onChange={(v) => setForm({ ...form, priority: v as Lead["priority"] })} options={["High", "Medium", "Low"].map((p) => ({ label: p, value: p }))} />
               <Input label="Source" placeholder="BNI, Referral, Google…" value={form.source} onChange={(v) => setForm({ ...form, source: v })} />
               <TextArea className="md:col-span-2" label="Notes" value={form.notes} onChange={(v) => setForm({ ...form, notes: v })} />
               <div className="lg:col-span-4 flex items-center gap-3">
                 <button type="submit" className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 transition ring-1 ring-sky-500/30">
                   <Plus className="size-4" /> Add Lead
                 </button>
-                <button type="button" onClick={resetForm} className="text-sm text-zinc-300 hover:text-white">Clear</button>
+                <button type="button" onClick={resetForm} className="text-sm text-zinc-300 hover:text-white">
+                  Clear
+                </button>
               </div>
             </form>
           )}
@@ -339,17 +399,13 @@ export default function LeadsTracker() {
         {/* Groups by Status */}
         <div className="mt-8 grid grid-cols-1 xl:grid-cols-2 gap-6">
           {STATUSES.map((status) => (
-            <motion.div
-              key={status}
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.2 }}
-              className="rounded-2xl bg-zinc-900/50 ring-1 ring-white/10"
-            >
+            <motion.div key={status} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className="rounded-2xl bg-zinc-900/50 ring-1 ring-white/10">
               <div className="flex items-center justify-between p-4">
                 <div className="flex items-center gap-3">
                   <span className={`px-2.5 py-1 text-xs rounded-full ${statusStyles[status]}`}>{status}</span>
-                  <span className="text-sm text-zinc-400">{grouped[status].length} lead{grouped[status].length === 1 ? "" : "s"}</span>
+                  <span className="text-sm text-zinc-400">
+                    {grouped[status].length} lead{grouped[status].length === 1 ? "" : "s"}
+                  </span>
                 </div>
               </div>
               <ul className="divide-y divide-white/5">
@@ -374,9 +430,7 @@ export default function LeadsTracker() {
                     )}
                   </li>
                 ))}
-                {grouped[status].length === 0 && (
-                  <li className="p-4 text-sm text-zinc-400">No leads in this status.</li>
-                )}
+                {grouped[status].length === 0 && <li className="p-4 text-sm text-zinc-400">No leads in this status.</li>}
               </ul>
             </motion.div>
           ))}
@@ -403,18 +457,22 @@ function DisplayRow({
       <div className="min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
           <h3 className="font-medium truncate max-w-[22ch]">{lead.name}</h3>
-          {lead.business && (
-            <span className="text-sm text-zinc-400 truncate max-w-[28ch]">• {lead.business}</span>
-          )}
+          {lead.business && <span className="text-sm text-zinc-400 truncate max-w-[28ch]">• {lead.business}</span>}
           <span className={`ml-1 text-xs px-2 py-0.5 rounded-full ring-1 ${statusStyles[lead.status]}`}>{lead.status}</span>
-          <span className={`ml-1 text-xs`}><span className={priorityStyles[lead.priority]}>●</span> {lead.priority}</span>
+          <span className={`ml-1 text-xs`}>
+            <span className={priorityStyles[lead.priority]}>●</span> {lead.priority}
+          </span>
         </div>
         <div className="mt-1 flex flex-wrap gap-3 text-xs text-zinc-400">
           {lead.email && (
-            <span className="inline-flex items-center gap-1"><Mail className="size-3" /> {lead.email}</span>
+            <span className="inline-flex items-center gap-1">
+              <Mail className="size-3" /> {lead.email}
+            </span>
           )}
           {lead.phone && (
-            <span className="inline-flex items-center gap-1"><Phone className="size-3" /> {lead.phone}</span>
+            <span className="inline-flex items-center gap-1">
+              <Phone className="size-3" /> {lead.phone}
+            </span>
           )}
           {lead.website && (
             <a className="inline-flex items-center gap-1 hover:text-white" href={lead.website} target="_blank" rel="noreferrer">
@@ -422,29 +480,29 @@ function DisplayRow({
             </a>
           )}
           {lead.source && (
-            <span className="inline-flex items-center gap-1"><Tag className="size-3" /> {lead.source}</span>
+            <span className="inline-flex items-center gap-1">
+              <Tag className="size-3" /> {lead.source}
+            </span>
           )}
-          <span className="inline-flex items-center gap-1"><CalendarDays className="size-3" /> Updated {timeAgo(lead.updatedAt)}</span>
+          <span className="inline-flex items-center gap-1">
+            <CalendarDays className="size-3" /> Updated {timeAgo(lead.updatedAt)}
+          </span>
         </div>
         {lead.notes && <p className="mt-2 text-sm text-zinc-300/90 whitespace-pre-wrap">{lead.notes}</p>}
       </div>
       <div className="flex items-center gap-2">
-        <select
-          value={lead.status}
-          onChange={(e) => onQuickChange({ status: e.target.value as Status })}
-          className="rounded-lg bg-zinc-900 ring-1 ring-white/10 px-2 py-1 text-xs"
-        >
+        <select value={lead.status} onChange={(e) => onQuickChange({ status: e.target.value as Status })} className="rounded-lg bg-zinc-900 ring-1 ring-white/10 px-2 py-1 text-xs">
           {STATUSES.map((s) => (
-            <option key={s} value={s}>{s}</option>
+            <option key={s} value={s}>
+              {s}
+            </option>
           ))}
         </select>
-        <select
-          value={lead.priority}
-          onChange={(e) => onQuickChange({ priority: e.target.value as Lead["priority"] })}
-          className="rounded-lg bg-zinc-900 ring-1 ring-white/10 px-2 py-1 text-xs"
-        >
+        <select value={lead.priority} onChange={(e) => onQuickChange({ priority: e.target.value as Lead["priority"] })} className="rounded-lg bg-zinc-900 ring-1 ring-white/10 px-2 py-1 text-xs">
           {(["High", "Medium", "Low"] as const).map((p) => (
-            <option key={p} value={p}>{p}</option>
+            <option key={p} value={p}>
+              {p}
+            </option>
           ))}
         </select>
         <button onClick={onEdit} className="p-2 rounded-lg bg-zinc-900 ring-1 ring-white/10 hover:bg-white/10">
@@ -488,7 +546,16 @@ function Label({ children }: { children: React.ReactNode }) {
   return <label className="block text-xs text-zinc-400 mb-1">{children}</label>;
 }
 
-function Input({ label, value, onChange, type = "text", placeholder, leftIcon, required, className = "" }: {
+function Input({
+  label,
+  value,
+  onChange,
+  type = "text",
+  placeholder,
+  leftIcon,
+  required,
+  className = "",
+}: {
   label: string;
   value: string;
   onChange: (v: string) => void;
@@ -516,13 +583,7 @@ function Input({ label, value, onChange, type = "text", placeholder, leftIcon, r
   );
 }
 
-function TextArea({ label, value, onChange, placeholder, className = "" }: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  placeholder?: string;
-  className?: string;
-}) {
+function TextArea({ label, value, onChange, placeholder, className = "" }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; className?: string }) {
   return (
     <div className={className}>
       <Label>{label}</Label>
@@ -537,7 +598,13 @@ function TextArea({ label, value, onChange, placeholder, className = "" }: {
   );
 }
 
-function Select({ label, value, onChange, options, className = "" }: {
+function Select({
+  label,
+  value,
+  onChange,
+  options,
+  className = "",
+}: {
   label: string;
   value: string;
   onChange: (v: string) => void;
@@ -547,13 +614,11 @@ function Select({ label, value, onChange, options, className = "" }: {
   return (
     <div className={className}>
       <Label>{label}</Label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-xl bg-zinc-900 ring-1 ring-white/10 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
-      >
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-xl bg-zinc-900 ring-1 ring-white/10 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500">
         {options.map((o) => (
-          <option key={o.value} value={o.value}>{o.label}</option>
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
         ))}
       </select>
     </div>
