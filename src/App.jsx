@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { initializeApp, getApp, getApps } from "firebase/app";
 import { getFirestore, doc, onSnapshot, setDoc, serverTimestamp } from "firebase/firestore";
+import { Routes, Route, Link, Navigate } from "react-router-dom";
+import Leads from "./pages/leads.jsx"; // adjust path if you used .tsx
 
 // ===== Error Boundary (so we never hang on init) =====
 class ErrorBoundary extends React.Component {
@@ -718,7 +720,20 @@ function AddTodoInput({ onAdd }){
 export default function App(){
   return (
     <ErrorBoundary>
-      <TrackerInner />
+      {/* Simple top nav (optional) */}
+      <nav className="px-6 py-3 border-b border-neutral-800 bg-neutral-950 sticky top-0 z-10">
+        <div className="max-w-5xl mx-auto flex items-center gap-4">
+          <Link to="/" className="text-neutral-200 hover:text-white">Dashboard</Link>
+          <Link to="/leads" className="text-neutral-200 hover:text-white">Leads</Link>
+        </div>
+      </nav>
+
+      {/* Route views */}
+      <Routes>
+        <Route path="/" element={<TrackerInner />} />
+        <Route path="/leads" element={<Leads />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
     </ErrorBoundary>
   );
 }
